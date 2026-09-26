@@ -1,5 +1,3 @@
-/08_EG_FUG_L2_RTT_2016.sql
-/08_EG_FUG_L2_RTT_2016.xml
-/demo_after.sql
-/demo_untranslated.xml
-/provv_fact.sql
+*.sql
+*.xml
+_test_*
