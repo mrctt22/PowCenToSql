@@ -19,9 +19,20 @@ that is parsed here and surfaced on the IR:
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
-from .ir import Edge, Group, Mapping, Node, Port
+if __package__:
+    from .ir import Edge, Group, Mapping, Node, Port
+else:
+    # Allow running this file directly, e.g. ``python pc2sql/parser.py x.xml``
+    # or launching it from the debugger, without the
+    # "attempted relative import with no known parent package" error.
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from pc2sql.ir import Edge, Group, Mapping, Node, Port  # type: ignore[import-not-found]
 
 
 def _attr(el: ET.Element, name: str, default: str = "") -> str:
@@ -72,10 +83,65 @@ def _field_dependencies(el: ET.Element) -> list[tuple[str, str]]:
         out.append((_attr(fd, "INPUTFIELD"), _attr(fd, "OUTPUTFIELD")))
     return out
 
+_ATTR_RE = re.compile(rb'([\w:.-]+)\s*=\s*"([^"]*)"')
+_ENTITY_RE = re.compile(rb"&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);")
+
+
+def _escape_attr_value(value: bytes) -> bytes:
+    """Escape '<' and bare '&' inside an attribute value.
+
+    PowerCenter exports sometimes embed SQL predicates such as ``<=`` or
+    ``>=`` directly in a TABLEATTRIBUTE VALUE without escaping them, which
+    makes the document invalid XML.  Existing entities (``&amp;``, ``&#39;``,
+    ...) are preserved; only raw ``<`` and dangling ``&`` are rewritten.
+    """
+    out = bytearray()
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i:i + 1]
+        if ch == b"<":
+            out += b"&lt;"
+            i += 1
+        elif ch == b"&":
+            m = _ENTITY_RE.match(value, i)
+            if m is not None:
+                out += m.group(0)
+                i = m.end()
+            else:
+                out += b"&amp;"
+                i += 1
+        else:
+            out += ch
+            i += 1
+    return bytes(out)
+
+
+def _load_root(path: str) -> ET.Element:
+    """Parse the XML root element, tolerating common export/export-save quirks.
+
+    Browsers (and some download tools) prepend a plain-text banner such as
+    "This XML file does not appear to have any style information associated
+    with it. The document tree is shown below." when an export is saved from
+    the browser.  XML forbids content before the root element, so anything
+    ahead of the first '<' is discarded.  In addition, stray '<' and '&'
+    characters inside attribute values (unescaped SQL operators are the usual
+    offenders) are repaired.  Both steps are no-ops for well-formed input.
+    """
+    data = Path(path).read_bytes()
+    start = data.find(b"<")
+    if start == -1:
+        raise ET.ParseError(f"no XML content found in {path}")
+    if start > 0:
+        data = data[start:]
+    data = _ATTR_RE.sub(
+        lambda m: m.group(1) + b'="' + _escape_attr_value(m.group(2)) + b'"',
+        data,
+    )
+    return ET.fromstring(data)
+
 
 def parse(path: str) -> Mapping:
-    tree = ET.parse(path)
-    root = tree.getroot()                       # <POWERMART>
+    root = _load_root(path)                     # <POWERMART>
 
     repo = root.find("REPOSITORY")
     folder = repo.find("FOLDER") if repo is not None else None
@@ -205,3 +271,19 @@ def _topo_sort(m: Mapping) -> None:
             order.append(n)
 
     m.order = order
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("usage: python parser.py <mapping.xml>", file=sys.stderr)
+        raise SystemExit(2)
+
+    parsed = parse(sys.argv[1])
+    print(
+        f"mapping {parsed.name!r} [{parsed.repository}/{parsed.folder}]: "
+        f"{len(parsed.nodes)} objects, {len(parsed.edges)} connectors"
+    )
+    for object_name in parsed.order:
+        print(f"  {object_name}  ({parsed.nodes[object_name].type})")
