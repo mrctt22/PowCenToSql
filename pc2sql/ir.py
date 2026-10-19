@@ -37,6 +37,8 @@ class Port:
     group: str = ""             # GROUP attribute (Router / Union output/input groups)
     ref_field: str = ""         # REF_FIELD attribute (Router output -> input field)
     outputgroup: str = ""       # OUTPUTGROUP attribute (Union)
+    issortkey: str = ""         # ISSORTKEY attribute (Sorter: YES on sort ports)
+    sortdirection: str = ""     # SORTDIRECTION attribute (Sorter: ASCENDING / DESCENDING)
 
 
 @dataclass

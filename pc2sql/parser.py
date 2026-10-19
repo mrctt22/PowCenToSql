@@ -54,6 +54,8 @@ def _ports_from_fields(el: ET.Element, tag: str) -> list[Port]:
             group=_attr(f, "GROUP"),
             ref_field=_attr(f, "REF_FIELD"),
             outputgroup=_attr(f, "OUTPUTGROUP"),
+            issortkey=_attr(f, "ISSORTKEY"),
+            sortdirection=_attr(f, "SORTDIRECTION"),
         ))
     return ports
 
@@ -83,17 +85,71 @@ def _field_dependencies(el: ET.Element) -> list[tuple[str, str]]:
         out.append((_attr(fd, "INPUTFIELD"), _attr(fd, "OUTPUTFIELD")))
     return out
 
-_ATTR_RE = re.compile(rb'([\w:.-]+)\s*=\s*"([^"]*)"')
+_ATTR_START_RE = re.compile(rb'([\w:.-]+)\s*=\s*"')
 _ENTITY_RE = re.compile(rb"&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);")
+_NAME_BYTES = frozenset(
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:.-"
+)
+_WS_BYTES = frozenset(b" \t\r\n")
+
+
+def _find_attr_close(data: bytes, start: int) -> int:
+    """Return the index of the quote that really closes an attribute value.
+
+    Export files occasionally contain unescaped double quotes *inside* an
+    attribute value (typically an EXPRESSION holding string literals such as
+    ``... = 'Caso "vita"', ...``).  A quote only closes the value when it is
+    followed by the end of the tag (``>``, ``/>`` or ``?>``) or by whitespace
+    and the next ``NAME=`` attribute; any other quote is part of the value.
+    Scanning also stops at the next tag, so a missing closing quote cannot
+    swallow the rest of the document.
+    """
+    n = len(data)
+    quote = data.find(b'"', start)
+    while quote != -1:
+        lt = data.find(b"<", start, quote)
+        while lt != -1:
+            nxt = data[lt + 1:lt + 2]
+            if nxt and (nxt.isalpha() or nxt in (b"/", b"?", b"!")):
+                return -1                      # crossed into another tag
+            lt = data.find(b"<", lt + 1, quote)
+        j = quote + 1
+        ws = 0
+        while j < n and data[j] in _WS_BYTES:
+            j += 1
+            ws += 1
+        if j >= n:
+            return quote
+        ch = data[j]
+        if ch == ord(">"):
+            return quote
+        if ch == ord("/") or ch == ord("?"):
+            k = j + 1
+            while k < n and data[k] in _WS_BYTES:
+                k += 1
+            if k < n and data[k] == ord(">"):
+                return quote
+        elif ws:
+            k = j
+            while k < n and data[k] in _NAME_BYTES:
+                k += 1
+            end_name = k
+            while k < n and data[k] in _WS_BYTES:
+                k += 1
+            if end_name > j and k < n and data[k] == ord("="):
+                return quote
+        quote = data.find(b'"', quote + 1)
+    return -1
 
 
 def _escape_attr_value(value: bytes) -> bytes:
-    """Escape '<' and bare '&' inside an attribute value.
+    """Escape '<', '"' and bare '&' inside an attribute value.
 
     PowerCenter exports sometimes embed SQL predicates such as ``<=`` or
-    ``>=`` directly in a TABLEATTRIBUTE VALUE without escaping them, which
-    makes the document invalid XML.  Existing entities (``&amp;``, ``&#39;``,
-    ...) are preserved; only raw ``<`` and dangling ``&`` are rewritten.
+    ``>=`` directly in a TABLEATTRIBUTE VALUE without escaping them, or use
+    bare double quotes inside string literals, which makes the document
+    invalid XML.  Existing entities (``&amp;``, ``&#39;``, ...) are preserved;
+    only raw ``<``, ``"`` and dangling ``&`` are rewritten.
     """
     out = bytearray()
     i, n = 0, len(value)
@@ -101,6 +157,9 @@ def _escape_attr_value(value: bytes) -> bytes:
         ch = value[i:i + 1]
         if ch == b"<":
             out += b"&lt;"
+            i += 1
+        elif ch == b'"':
+            out += b"&quot;"
             i += 1
         elif ch == b"&":
             m = _ENTITY_RE.match(value, i)
@@ -116,6 +175,25 @@ def _escape_attr_value(value: bytes) -> bytes:
     return bytes(out)
 
 
+def _repair_attributes(data: bytes) -> bytes:
+    """Repair attribute values that contain unescaped XML special characters."""
+    out = bytearray()
+    pos = 0
+    for match in _ATTR_START_RE.finditer(data):
+        if match.start() < pos:          # inside a value already handled
+            continue
+        value_start = match.end()
+        value_end = _find_attr_close(data, value_start)
+        if value_end == -1:
+            continue
+        out += data[pos:value_start]
+        out += _escape_attr_value(data[value_start:value_end])
+        out += b'"'
+        pos = value_end + 1
+    out += data[pos:]
+    return bytes(out)
+
+
 def _load_root(path: str) -> ET.Element:
     """Parse the XML root element, tolerating common export/export-save quirks.
 
@@ -123,9 +201,10 @@ def _load_root(path: str) -> ET.Element:
     "This XML file does not appear to have any style information associated
     with it. The document tree is shown below." when an export is saved from
     the browser.  XML forbids content before the root element, so anything
-    ahead of the first '<' is discarded.  In addition, stray '<' and '&'
-    characters inside attribute values (unescaped SQL operators are the usual
-    offenders) are repaired.  Both steps are no-ops for well-formed input.
+    ahead of the first '<' is discarded.  In addition, stray '<', '&' and
+    embedded '"' characters inside attribute values (unescaped SQL operators
+    and quoted string literals are the usual offenders) are repaired.  Both
+    steps are no-ops for well-formed input.
     """
     data = Path(path).read_bytes()
     start = data.find(b"<")
@@ -133,10 +212,7 @@ def _load_root(path: str) -> ET.Element:
         raise ET.ParseError(f"no XML content found in {path}")
     if start > 0:
         data = data[start:]
-    data = _ATTR_RE.sub(
-        lambda m: m.group(1) + b'="' + _escape_attr_value(m.group(2)) + b'"',
-        data,
-    )
+    data = _repair_attributes(data)
     return ET.fromstring(data)
 
 

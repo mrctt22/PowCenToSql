@@ -17,6 +17,9 @@ Group-based transformations are expanded into one SQL object per output group:
   the other input group, direction from ``Join Type``).
 * Union            -> CTE with ``UNION ALL`` of every input group, mapping
   input fields to output fields via ``FIELDDEPENDENCY``.
+* Sorter           -> passthrough CTE (``SELECT DISTINCT`` when
+  ``Distinct=YES``); sort keys are recorded as comments because T-SQL has no
+  ordered relation and a CTE-level ORDER BY would not survive downstream.
 * Update Strategy  -> an INSERT / UPDATE / DELETE / MERGE statement (a
   statement block, not a CTE) whose form follows ``Update Strategy Expression``.
 """
@@ -56,6 +59,27 @@ def _upstreams(m: Mapping, node: Node) -> list[str]:
 def _input_map(m: Mapping, node: Node) -> dict[str, str]:
     """input port name -> upstream column name (from the connectors)."""
     return {e.to_field: e.from_field for e in m.edges if e.to_obj == node.name}
+
+
+def _render_select_list(items: list[tuple[str, str]]) -> str:
+    """Render SELECT items as ``code[,]  -- comment`` lines.
+
+    ``items`` holds ``(code, comment)`` pairs.  A T-SQL ``--`` comment runs to
+    the end of the line, so the separator comma belongs to the SQL item and
+    must be emitted *before* the comment: ``expr AS [x],  -- x``.  Emitting
+    ``expr AS [x]  -- x,`` would comment out the comma and leave the SELECT
+    list unterminated.
+    """
+    out: list[str] = []
+    last = len(items) - 1
+    for idx, (code, comment) in enumerate(items):
+        line = "        " + code
+        if idx != last:
+            line += ","
+        if comment:
+            line += f"  -- {comment}"
+        out.append(line)
+    return "\n".join(out)
 
 
 def _substitute(expr: str, mapping: dict[str, str]) -> str:
@@ -160,6 +184,9 @@ def _emit_sq(node: Node, m: Mapping) -> str:
         # expression translator, so any source-dialect syntax stays as-is) but
         # wrapped in a CTE so downstream references resolve to a defined name.
         lines.append("--   custom SQL override (kept verbatim, wrapped in a CTE)")
+        if "\n" not in query_attr and "\r" not in query_attr and "--" in query_attr:
+            lines.append("-- WARNING: the override contains inline '--' comments but the export")
+            lines.append("--          flattened its line breaks; restore the newlines before executing.")
         lines.append(f"{_ident(node.name)} AS (")
         lines.append(query_attr)
         lines.append(")")
@@ -209,23 +236,23 @@ def _emit_expression(node: Node, m: Mapping) -> str:
     lines = [_banner(node)]
     lines.append(f"{_ident(node.name)} AS (")
 
-    select_lines = []
+    select_lines: list[tuple[str, str]] = []
     for p in node.output_ports:
         if p in node.local_variables:
             continue
         is_passthrough = (p.expression or "").strip() == p.name or not (p.expression or "").strip()
         if is_passthrough:
-            select_lines.append(_ident(p.name))
+            select_lines.append((_ident(p.name), ""))
         else:
             expr = _substitute(p.expression, lv_alias)
             expr = translate(expr)
-            select_lines.append(f"{expr} AS {_ident(p.name)}  -- {p.name}")
+            select_lines.append((f"{expr} AS {_ident(p.name)}", p.name))
 
     # Always wrap the upstream in a rename subquery so this node's input-port
     # names (which may differ from the upstream column names) are available to
     # both the output expressions and any CROSS APPLY local variables.
     lines.append("    SELECT")
-    lines.append("        " + ",\n        ".join(select_lines))
+    lines.append(_render_select_list(select_lines))
     lines.append("    FROM (")
     if rename_cols:
         lines.append("        SELECT " + ",\n               ".join(rename_cols))
@@ -260,21 +287,55 @@ def _emit_aggregator(node: Node, m: Mapping) -> str:
     lines = [_banner(node)]
     lines.append(f"{_ident(node.name)} AS (")
 
-    select_lines = []
+    select_lines: list[tuple[str, str]] = []
     for p in group_ports:
-        select_lines.append(_ident(p.name))
+        select_lines.append((_ident(p.name), ""))
     for p in agg_ports:
         expr = translate(p.expression)
-        select_lines.append(f"{expr} AS {_ident(p.name)}  -- {p.name}")
+        select_lines.append((f"{expr} AS {_ident(p.name)}", p.name))
 
     lines.append("    SELECT")
-    lines.append("        " + ",\n        ".join(select_lines))
+    lines.append(_render_select_list(select_lines))
     lines.append("    FROM (")
     lines.append("        SELECT " + ", ".join(rename_cols))
     lines.append(f"        {from_clause}")
     lines.append("    ) src")
     if group_ports:
         lines.append("    GROUP BY " + ", ".join(_ident(p.name) for p in group_ports))
+    lines.append(")")
+    return "\n".join(lines)
+
+
+def _emit_sorter(node: Node, m: Mapping) -> str:
+    """Sorter -> passthrough CTE, with the PowerCenter sort keys documented.
+
+    A Sorter only orders rows (PowerCenter uses it to feed Sorted Input
+    aggregators/joiners).  T-SQL has no ordered relation and the optimizer is
+    free to discard an ORDER BY inside a CTE, so emitting one would falsely
+    promise ordering: the CTE passes the rows through instead and records the
+    keys as comments.  ``Distinct=YES`` is a real semantic (deduplication),
+    so it is emitted as ``SELECT DISTINCT``.
+    """
+    upstream = _upstream_refs(m, node)
+    from_cte = upstream[0] if upstream else "(none)"
+    distinct = (node.attributes.get("Distinct", "") or "").strip().upper() == "YES"
+    sort_keys = [
+        (p.name, (p.sortdirection or "ASCENDING").upper())
+        for p in node.ports
+        if (p.issortkey or "").strip().upper() == "YES"
+    ]
+    cols = [p.name for p in node.output_ports] or [p.name for p in node.ports]
+
+    lines = [_banner(node)]
+    lines.append("--   sort keys : " + (
+        ", ".join(f"{name} {direction}" for name, direction in sort_keys)
+        if sort_keys else "(none)"
+    ))
+    lines.append("--   (ordering is informational: T-SQL does not preserve CTE row order)")
+    lines.append(f"{_ident(node.name)} AS (")
+    lines.append("    SELECT" + (" DISTINCT" if distinct else ""))
+    lines.append("        " + ",\n        ".join(_ident(c) for c in cols))
+    lines.append(f"    FROM {from_cte}")
     lines.append(")")
     return "\n".join(lines)
 
@@ -586,6 +647,8 @@ def emit(m: Mapping) -> str:
             cte_lines.append(_emit_expression(node, m))
         elif node.type == "Aggregator":
             cte_lines.append(_emit_aggregator(node, m))
+        elif node.type == "Sorter":
+            cte_lines.append(_emit_sorter(node, m))
         elif node.type == "Filter":
             cte_lines.append(_emit_filter(node, m))
         elif node.type == "Joiner":

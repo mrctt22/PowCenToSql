@@ -17,8 +17,9 @@ silently dropped.
 
 Conversions handled by the scalar passes (see each helper's docstring):
 ``CHR`` -> ``CHAR``, ``TO_CHAR`` -> ``CAST(... AS VARCHAR(255))``,
-``TO_DATE`` -> ``TRY_CONVERT(DATE, ...)``, ``DECODE`` -> ``CASE ... END``,
-``SUBSTR`` -> ``SUBSTRING``, and ``||`` -> ``+``.
+``TO_DATE`` -> ``TRY_CONVERT(DATE, ...)``, ``TO_INTEGER`` -> ``TRY_CAST(... AS INT)``,
+``ZEROIFNULL`` -> ``COALESCE(..., 0)``, ``DATE_DIFF`` -> ``DATEDIFF(...)``,
+``DECODE`` -> ``CASE ... END``, ``SUBSTR`` -> ``SUBSTRING``, and ``||`` -> ``+``.
 """
 
 from __future__ import annotations
@@ -28,14 +29,141 @@ from bisect import bisect_right
 from collections import defaultdict
 
 
+def _string_end(s: str, i: int) -> int:
+    """Index just past the single-quoted literal starting at ``s[i]``."""
+    n = len(s)
+    j = i + 1
+    while j < n:
+        if s[j] == "'":
+            if j + 1 < n and s[j + 1] == "'":
+                j += 2
+                continue
+            return j + 1
+        j += 1
+    return n
+
+
+# Code resumption markers used to recover where an inline ``--`` comment ends
+# when the export has flattened an expression onto a single line.
+_RESUME_RE = re.compile(
+    r"(?:,\s*(?:'|[A-Za-z_0-9(])"                       # next argument
+    r"|\)\s*(?:AND|OR|THEN|ELSE|END|,|\))"              # closing paren + code
+    r"|\b(?:AND|OR|THEN|ELSE|END)\b"                    # operator keyword
+    r"|\b[A-Za-z_][A-Za-z0-9_]*\s*(?:=|<>|<=|>=|<|>))",  # comparison
+    re.IGNORECASE,
+)
+
+
+def _is_code_position(depth: int, base_depth: int) -> bool:
+    return depth == base_depth
+
+
+def _comment_end(s: str, start: int, base_depth: int) -> int:
+    """Best-effort end of a flattened inline comment starting after ``--``.
+
+    The export can lose the line breaks that terminated PowerCenter comments,
+    leaving a single line such as ``... or --note FLAG = '1' ) AND ...``.  The
+    comment ends where the expression resumes: a comma/short-circuit operator,
+    a closing parenthesis followed by code, or an ``identifier =`` comparison,
+    found at the same parenthesis depth at which the comment began.  If no
+    resumption is found, the comment runs to the end of the expression.
+    """
+    depth = base_depth
+    j = start
+    n = len(s)
+    while j < n:
+        c = s[j]
+        if c == "'":
+            j = _string_end(s, j)
+            continue
+        if c == "(":
+            depth += 1
+            j += 1
+            continue
+        if c == ")":
+            if depth > base_depth:
+                depth -= 1
+                j += 1
+                continue
+        if _is_code_position(depth, base_depth) and _RESUME_RE.match(s, j):
+            return j
+        j += 1
+    return n
+
+
+def _strip_inline_comment(s: str) -> str:
+    """Remove ``--`` comments from a flattened (single-line) expression."""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    depth = 0
+    while i < n:
+        c = s[i]
+        if c == "'":
+            j = _string_end(s, i)
+            out.append(s[i:j])
+            i = j
+            continue
+        if s[i:i + 2] == "--":
+            if depth == 0:
+                break                      # trailing comment -> drop the tail
+            end = _comment_end(s, i + 2, depth)
+            if 0 < end < n and out:
+                prev = out[-1][-1:] if out[-1] else ""
+                nxt = s[end]
+                if prev and (prev.isalnum() or prev == "'") and (nxt.isalnum() or nxt == "'"):
+                    out.append(" ")
+            i = end
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")" and depth > 0:
+            depth -= 1
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _strip_line_comment(line: str) -> str:
+    """Remove a trailing ``--`` comment from a single physical line."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i] == "'":
+            j = _string_end(line, i)
+            out.append(line[i:j])
+            i = j
+            continue
+        if line[i:i + 2] == "--":
+            break
+        out.append(line[i])
+        i += 1
+    return "".join(out)
+
+
 def strip_comments(expr: str) -> str:
-    """Drop PowerCenter ``--`` comment lines and blank lines."""
+    """Drop PowerCenter ``--`` comments and blank lines.
+
+    Multi-line expressions are processed line by line.  A single-line
+    expression is treated specially because an export can flatten the original
+    lines: the inline comments are then delimited by where the PowerCenter
+    expression resumes (see ``_comment_end``).
+    """
+    if "\n" not in expr and "\r" not in expr:
+        s = expr.strip()
+        if s.startswith("--"):
+            return ""
+        return _strip_inline_comment(s).strip()
+
     kept = []
     for line in expr.splitlines():
         s = line.strip()
         if s.startswith("--"):
             continue
-        kept.append(line)
+        s = _strip_line_comment(line)
+        if s.strip():
+            kept.append(s)
     return "\n".join(kept).strip()
 
 
@@ -126,10 +254,13 @@ def _replace_agg(s: str, fn: str) -> str:
 # --- IIF ----------------------------------------------------------------------
 
 def _translate_iif(s: str) -> str:
-    """Nested ``IIF(cond, then, else)`` -> ``CASE WHEN ... THEN ... ELSE ... END``.
+    """Nested ``IIF(cond, then [, else])`` -> ``CASE WHEN ... THEN ... END``.
 
     Recursive, so nested IIFs (which PowerCenter writes in the ELSE branch)
-    are handled naturally.
+    are handled naturally.  PowerCenter also accepts the two-argument form
+    ``IIF(cond, then)`` (used for conditional aggregates such as
+    ``IIF(flag = '0', SUM(x))``); it returns NULL when the condition is false,
+    which is exactly what a CASE without ELSE does in T-SQL.
     """
     out: list[str] = []
     i = 0
@@ -151,6 +282,14 @@ def _translate_iif(s: str) -> str:
                         )
                         i = end + 1
                         continue
+                    if len(parts) == 2:
+                        cond, then_ = parts
+                        out.append(
+                            f"CASE WHEN {_translate_iif(cond)} "
+                            f"THEN {_translate_iif(then_)} END"
+                        )
+                        i = end + 1
+                        continue
         out.append(s[i])
         i += 1
     return "".join(out)
@@ -163,6 +302,9 @@ def _translate_scalars(s: str) -> str:
     s = _replace_isnull(s)
     s = _replace_replacestr(s)
     s = _replace_conversions(s)   # CHR / TO_CHAR / TO_DATE
+    s = _replace_to_integer(s)    # TO_INTEGER -> TRY_CAST(... AS INT)
+    s = _replace_zeroifnull(s)    # ZEROIFNULL -> COALESCE(..., 0)
+    s = _replace_date_diff(s)     # DATE_DIFF -> DATEDIFF
     s = _replace_decode(s)        # DECODE -> CASE ... END
     s = _replace_substr(s)        # SUBSTR -> SUBSTRING
     s = _replace_concat(s)        # || -> + (PowerCenter string concatenation)
@@ -381,6 +523,121 @@ def _is_null_literal(x: str) -> bool:
     return x.strip().upper() == "NULL"
 
 
+def _replace_to_integer(s: str) -> str:
+    """``TO_INTEGER(x)`` -> ``TRY_CAST(x AS INT)``.
+
+    PowerCenter converts a string/number to an integer, truncating the
+    fractional part.  T-SQL ``CAST`` also truncates a numeric value toward
+    zero, and ``TRY_CAST`` additionally returns NULL instead of raising on an
+    unconvertible string (closer to PowerCenter's runtime conversion-error
+    handling than a hard CAST -- documented choice).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "'":
+            i = _skip_string_literal(s, i, out)
+            continue
+        if s[i] in "tT" and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")):
+            m = re.match(r"TO_INTEGER\s*\(", s[i:], re.IGNORECASE)
+            if m:
+                j = i + m.end() - 1
+                end = _find_matching(s, j)
+                if end != -1:
+                    arg = _replace_to_integer(s[j + 1:end].strip())
+                    out.append(f"TRY_CAST({arg} AS INT)")
+                    i = end + 1
+                    continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _replace_zeroifnull(s: str) -> str:
+    """``ZEROIFNULL(x)`` -> ``COALESCE(x, 0)``.
+
+    PowerCenter ZEROIFNULL returns 0 when its argument is NULL.  COALESCE is
+    used instead of T-SQL ISNULL because the latter is also a PowerCenter
+    function with different semantics (a one-argument NULL test).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "'":
+            i = _skip_string_literal(s, i, out)
+            continue
+        if s[i] in "zZ" and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")):
+            m = re.match(r"ZEROIFNULL\s*\(", s[i:], re.IGNORECASE)
+            if m:
+                j = i + m.end() - 1
+                end = _find_matching(s, j)
+                if end != -1:
+                    arg = _replace_zeroifnull(s[j + 1:end].strip())
+                    out.append(f"COALESCE({arg}, 0)")
+                    i = end + 1
+                    continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+# PowerCenter DATE_DIFF format -> T-SQL DATEDIFF datepart.  Only the
+# documented unambiguous formats are mapped; anything else is left
+# untranslated (and reported by _warn_untranslated) rather than guessed.
+_DATE_DIFF_UNITS = {
+    "Y": "YEAR", "YY": "YEAR", "YYY": "YEAR", "YYYY": "YEAR", "YEAR": "YEAR",
+    "Q": "QUARTER", "QQ": "QUARTER", "QUARTER": "QUARTER",
+    "M": "MONTH", "MM": "MONTH", "MON": "MONTH", "MONTH": "MONTH",
+    "W": "WEEK", "WW": "WEEK", "WEEK": "WEEK",
+    "D": "DAY", "DD": "DAY", "DAY": "DAY",
+    "HH": "HOUR", "HH12": "HOUR", "HH24": "HOUR", "HOUR": "HOUR",
+    "MI": "MINUTE", "MIN": "MINUTE", "MINUTE": "MINUTE",
+    "SS": "SECOND", "SEC": "SECOND", "SECOND": "SECOND",
+    "MS": "MILLISECOND", "MILLISECOND": "MILLISECOND",
+}
+
+
+def _date_diff_unit(fmt: str) -> str:
+    """Map a PowerCenter DATE_DIFF format argument to a T-SQL datepart."""
+    return _DATE_DIFF_UNITS.get(fmt.strip().strip("'\"").upper(), "")
+
+
+def _replace_date_diff(s: str) -> str:
+    """``DATE_DIFF(date1, date2, fmt)`` -> ``DATEDIFF(unit, date2, date1)``.
+
+    PowerCenter returns ``date1 - date2``; T-SQL DATEDIFF takes the start date
+    first, so the two date arguments are swapped.  DATEDIFF counts datepart
+    boundaries (PowerCenter truncates the interval), a documented semantic
+    difference.  The format argument must be a known literal; otherwise the
+    call is left intact for the untranslated-function warning.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "'":
+            i = _skip_string_literal(s, i, out)
+            continue
+        if s[i] in "dD" and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")):
+            m = re.match(r"DATE_DIFF\s*\(", s[i:], re.IGNORECASE)
+            if m:
+                j = i + m.end() - 1
+                end = _find_matching(s, j)
+                if end != -1:
+                    parts = [_replace_date_diff(p) for p in _split_top_level(s[j + 1:end])]
+                    if len(parts) == 3:
+                        unit = _date_diff_unit(parts[2])
+                        if unit:
+                            out.append(f"DATEDIFF({unit}, {parts[1]}, {parts[0]})")
+                            i = end + 1
+                            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def _skip_string_literal(s: str, i: int, out: list[str]) -> int:
     """Append the single-quoted literal at ``s[i]`` to ``out``; return index after it.
 
@@ -556,8 +813,8 @@ def _replace_concat(s: str) -> str:
 # as untranslated.
 #
 # This is a whitelist of *handled* constructs, not an enumeration of the
-# unknown ones: any remaining PowerCenter function (TO_INTEGER, TO_DECIMAL,
-# ADD_MONTHS, TRUNC, ...) is caught generically by simply not being in this
+# unknown ones: any remaining PowerCenter function (TO_DECIMAL, ADD_MONTHS,
+# TRUNC, ...) is caught generically by simply not being in this
 # set.  DECODE and SUBSTR are now translated away by their own passes (into
 # ``CASE ... END`` and ``SUBSTRING``), so -- like IIF / ISNULL / REPLACESTR --
 # they do not survive as ``NAME(`` in the output and are NOT whitelisted
