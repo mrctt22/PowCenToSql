@@ -15,6 +15,8 @@ that is parsed here and surfaced on the IR:
 * ``<FIELDDEPENDENCY>`` elements (Union: ``INPUTFIELD`` -> ``OUTPUTFIELD``).
 * ``GROUP`` / ``REF_FIELD`` / ``OUTPUTGROUP`` TRANSFORMFIELD attributes.
 * ``TEMPLATENAME`` (Custom Transformation template id).
+* ``<MAPPINGVARIABLE>`` objects (``$$DATA_ELAB``, ``$$DATADW``, ...), surfaced
+  on ``Mapping.variables``.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 if __package__:
-    from .ir import Edge, Group, Mapping, Node, Port
+    from .ir import Edge, Group, Mapping, MappingVariable, Node, Port
 else:
     # Allow running this file directly, e.g. ``python pc2sql/parser.py x.xml``
     # or launching it from the debugger, without the
@@ -32,7 +34,7 @@ else:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from pc2sql.ir import Edge, Group, Mapping, Node, Port  # type: ignore[import-not-found]
+    from pc2sql.ir import Edge, Group, Mapping, MappingVariable, Node, Port  # type: ignore[import-not-found]
 
 
 def _attr(el: ET.Element, name: str, default: str = "") -> str:
@@ -84,6 +86,24 @@ def _field_dependencies(el: ET.Element) -> list[tuple[str, str]]:
     for fd in el.findall("FIELDDEPENDENCY"):
         out.append((_attr(fd, "INPUTFIELD"), _attr(fd, "OUTPUTFIELD")))
     return out
+
+
+def _mapping_variables(el: ET.Element) -> list[MappingVariable]:
+    """``<MAPPINGVARIABLE>`` children of a MAPPING -> MappingVariable list."""
+    return [
+        MappingVariable(
+            name=_attr(v, "NAME"),
+            datatype=_attr(v, "DATATYPE"),
+            default=_attr(v, "DEFAULTVALUE"),
+            aggfunction=_attr(v, "AGGFUNCTION"),
+            isparam=_attr(v, "ISPARAM"),
+            precision=_attr(v, "PRECISION"),
+            scale=_attr(v, "SCALE"),
+            description=_attr(v, "DESCRIPTION"),
+        )
+        for v in el.findall("MAPPINGVARIABLE")
+    ]
+
 
 _ATTR_START_RE = re.compile(rb'([\w:.-]+)\s*=\s*"')
 _ENTITY_RE = re.compile(rb"&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);")
@@ -245,6 +265,7 @@ def parse(path: str) -> Mapping:
         m = folder.find("MAPPING")
         if m is not None:
             mapping.name = _attr(m, "NAME")
+            mapping.variables = _mapping_variables(m)
 
             # transformation definitions
             trans_defs: dict[str, Node] = {}
@@ -359,7 +380,10 @@ if __name__ == "__main__":
     parsed = parse(sys.argv[1])
     print(
         f"mapping {parsed.name!r} [{parsed.repository}/{parsed.folder}]: "
-        f"{len(parsed.nodes)} objects, {len(parsed.edges)} connectors"
+        f"{len(parsed.nodes)} objects, {len(parsed.edges)} connectors, "
+        f"{len(parsed.variables)} mapping variables"
     )
+    for variable in parsed.variables:
+        print(f"  variable {variable.name}  ({variable.type_text})")
     for object_name in parsed.order:
         print(f"  {object_name}  ({parsed.nodes[object_name].type})")

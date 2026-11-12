@@ -16,10 +16,19 @@ inline ``-- WARNING: untranslated function: NAME(...)`` comment (see
 silently dropped.
 
 Conversions handled by the scalar passes (see each helper's docstring):
-``CHR`` -> ``CHAR``, ``TO_CHAR`` -> ``CAST(... AS VARCHAR(255))``,
+``CHR`` -> ``CHAR``, ``TO_CHAR`` -> ``CAST(... AS VARCHAR(255))`` (or
+``CONVERT(..., style)`` when the format is a known date format, or a
+``YEAR(...)`` extraction when the format is a year format),
+``GET_DATE_PART(x, 'YYYY')`` -> ``YEAR(...)`` extraction,
 ``TO_DATE`` -> ``TRY_CONVERT(DATE, ...)``, ``TO_INTEGER`` -> ``TRY_CAST(... AS INT)``,
 ``ZEROIFNULL`` -> ``COALESCE(..., 0)``, ``DATE_DIFF`` -> ``DATEDIFF(...)``,
 ``DECODE`` -> ``CASE ... END``, ``SUBSTR`` -> ``SUBSTRING``, and ``||`` -> ``+``.
+
+The database-dialect functions found in Source Qualifier SQL overrides are
+translated too (``translate_sql``): ``DATE 'x'`` -> ``CAST('x' AS DATE)``,
+``TRUNC``, ``ADD_MONTHS``, ``NVL``, ``SYSDATE`` / ``CURRENT_DATE``, and the
+Teradata ``NOT x = y`` predicate.  Mapping variables (``$$DATA_ELAB``) become
+``@DATA_ELAB`` references to the declarations the emitter writes.
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_right
 from collections import defaultdict
+from collections.abc import Iterable
 
 
 def _string_end(s: str, i: int) -> int:
@@ -41,6 +51,17 @@ def _string_end(s: str, i: int) -> int:
             return j + 1
         j += 1
     return n
+
+
+def _block_end(s: str, i: int) -> int:
+    """Index just past the ``/* ... */`` comment starting at ``s[i]``.
+
+    Block comments survive the export verbatim, so a ``'`` or ``--`` inside one
+    is not a quote/comment start.  Scanning without this step desynchronises on
+    the first apostrophe of a comment such as ``/* ... all' ID_Rapporto */``.
+    """
+    end = s.find("*/", i + 2)
+    return len(s) if end == -1 else end + 2
 
 
 # Code resumption markers used to recover where an inline ``--`` comment ends
@@ -197,15 +218,263 @@ def _split_top_level(s: str, sep: str = ",") -> list[str]:
     return parts
 
 
-def translate(expr: str) -> str:
+# --- mapping variables --------------------------------------------------------
+
+_VARIABLE_RE = re.compile(r"\$\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def substitute_variables(s: str, names: Iterable[str] | None = None) -> str:
+    """``$$DATA_ELAB`` -> ``@DATA_ELAB`` (declared by the emitter).
+
+    ``names`` holds the mapping variables actually declared by the mapping
+    (``Mapping.variable_names``); when omitted, every ``$$NAME`` is converted.
+
+    An occurrence inside a string literal is a *value* reference: the literal
+    ``'$$DATA_ELAB'`` becomes ``@DATA_ELAB`` (the declaration carries the
+    quotes), and a literal that mixes text and a variable such as
+    ``'pre$$X'`` becomes ``'pre' + @X``.  Converting such a literal to
+    ``'@DATA_ELAB'`` instead would turn the reference into the literal text
+    ``@DATA_ELAB`` and silently compare against the wrong value.
+    """
+    declared = None if names is None else {n.lstrip("$") for n in names}
+
+    def convert(name: str) -> str | None:
+        if declared is not None and name not in declared:
+            return None
+        return f"@{name}"
+
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    start = 0
+    while i < n:
+        if s.startswith("/*", i):
+            out.append(_VARIABLE_RE.sub(
+                lambda m: convert(m.group(1)) or m.group(0), s[start:i]))
+            end = _block_end(s, i)
+            out.append(s[i:end])
+            i = end
+            start = end
+            continue
+        if s[i] != "'":
+            i += 1
+            continue
+        out.append(_VARIABLE_RE.sub(
+            lambda m: convert(m.group(1)) or m.group(0), s[start:i]))
+        end = _string_end(s, i)
+        literal = s[i:end]
+        inner = literal[1:-1] if len(literal) >= 2 else ""
+        if "$$" in inner:
+            pieces: list[str] = []
+            pos = 0
+            for m in _VARIABLE_RE.finditer(inner):
+                var = convert(m.group(1))
+                if var is None:
+                    continue
+                text = inner[pos:m.start()]
+                if text:
+                    pieces.append("'" + text + "'")
+                pieces.append(var)
+                pos = m.end()
+            if pieces:
+                tail = inner[pos:]
+                if tail:
+                    pieces.append("'" + tail + "'")
+                out.append(" + ".join(pieces))
+            else:
+                out.append(literal)
+        else:
+            out.append(literal)
+        i = end
+        start = end
+    out.append(_VARIABLE_RE.sub(
+        lambda m: convert(m.group(1)) or m.group(0), s[start:n]))
+    return "".join(out)
+
+
+def translate(expr: str, variables: Iterable[str] | None = None) -> str:
     s = strip_comments(expr)
     if not s:
         return s
+    if variables:
+        s = substitute_variables(s, variables)
     s = _translate_aggregates(s)
     s = _translate_iif(s)
     s = _translate_scalars(s)
     s = _warn_untranslated(s)
     return s
+
+
+# --- Source Qualifier SQL overrides ------------------------------------------
+
+# Keywords that can start a clause or a predicate, used to find where a
+# flattened ``--`` comment ends (see ``_sql_comment_end``).  Deliberately
+# excludes weak operators such as IN / IS / NOT / AS / ON, which also occur
+# *inside* a commented-out predicate: resuming there would re-activate code the
+# developer had disabled.
+_SQL_RESUME_RE = re.compile(
+    r"(?:SELECT|FROM|WHERE|AND|OR|GROUP|ORDER|HAVING|UNION|CASE|WHEN|THEN|ELSE"
+    r"|END|JOIN|INNER|OUTER|FULL)\b",
+    re.IGNORECASE,
+)
+
+
+def _sql_comment_end(s: str, start: int, base_depth: int) -> int:
+    """Best-effort end of a flattened ``--`` comment inside a SQL statement.
+
+    The export replaces the line breaks of a multi-line override with spaces,
+    so a line comment no longer ends anywhere and would swallow the rest of the
+    statement.  The comment is taken to end at the first of:
+
+    * another ``--`` (the next comment line of the same statement),
+    * a ``/*`` block comment (the export preserves those, so the block must
+      have started on a later line),
+    * a clause/predicate keyword at the parenthesis depth the comment started
+      at,
+    * the ``)`` that closes the construct the comment started in,
+    * the end of the statement.
+
+    A keyword at the very beginning of the comment text is skipped: it is the
+    remainder of a commented-out line (``--AND ...``), not a resumption.
+    """
+    n = len(s)
+    j = start
+    depth = base_depth
+    seen_token = False
+    while j < n:
+        c = s[j]
+        if c == "'":
+            j = _string_end(s, j)
+            seen_token = True
+            continue
+        if depth == base_depth and (s.startswith("--", j) or s.startswith("/*", j)):
+            return j
+        if c == "(":
+            depth += 1
+            seen_token = True
+            j += 1
+            continue
+        if c == ")":
+            if depth > base_depth:
+                depth -= 1
+                seen_token = True
+                j += 1
+                continue
+            return j
+        if c in "\r\n":
+            return j
+        if depth == base_depth:
+            m = _SQL_RESUME_RE.match(s, j)
+            if m:
+                if not seen_token:      # first token of the comment -> not code
+                    j = m.end()
+                    seen_token = True
+                    continue
+                return j
+        if not c.isspace():
+            seen_token = True
+        j += 1
+    return n
+
+
+def reflow_comments(sql: str) -> str:
+    """Move every flattened ``--`` comment of a single-line statement back onto
+    its own line.
+
+    The export joins the lines of a SQL override with spaces; a ``--`` comment
+    then comments out the remainder of the statement and the CTE built from it
+    is invalid.  Restoring the comment on its own line keeps the statement
+    valid and the commented text visible for review.  The extent of each
+    comment is inferred by ``_sql_comment_end`` (best effort: verify the
+    result).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    depth = 0
+    last_code_char = ""
+    code_since_comment = False
+    while i < n:
+        if sql[i] == "'" or sql.startswith("/*", i):
+            j = _string_end(sql, i) if sql[i] == "'" else _block_end(sql, i)
+            out.append(sql[i:j])
+            last_code_char = sql[j - 1]
+            code_since_comment = True
+            i = j
+            continue
+        if sql.startswith("--", i):
+            end = _sql_comment_end(sql, i + 2, depth)
+            text = sql[i + 2:end].rstrip()
+            # A comma closing the comment belongs to the statement when real
+            # code precedes it and that code does not already end with one
+            # (``select a, b -- note,\nc``).  When the comment directly follows
+            # another comment the comma is part of the commented-out list
+            # (``--KEY_CF_OPER,``) and must stay inside it.
+            if (code_since_comment and text.endswith(",")
+                    and last_code_char not in ("", ",")):
+                text = text[:-1].rstrip()
+                out.append(",")
+                last_code_char = ","
+            if out and not out[-1].endswith("\n"):
+                out.append("\n")
+            out.append("--" + text + "\n")
+            code_since_comment = False
+            i = end
+            continue
+        if sql[i] in "\r\n":
+            if out and not out[-1].endswith("\n"):
+                out.append("\n")
+            i += 1
+            continue
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")" and depth > 0:
+            depth -= 1
+        out.append(sql[i])
+        if not sql[i].isspace():
+            last_code_char = sql[i]
+            code_since_comment = True
+        i += 1
+    return "".join(out).rstrip("\n")
+
+
+def has_flattened_comments(sql: str) -> bool:
+    """True for a single-line statement carrying ``--`` comments."""
+    if "\n" in sql or "\r" in sql:
+        return False
+    i, n = 0, len(sql)
+    while i < n:
+        if sql.startswith("/*", i):
+            i = _block_end(sql, i)
+            continue
+        if sql[i] == "'":
+            i = _string_end(sql, i)
+            continue
+        if sql.startswith("--", i):
+            return True
+        i += 1
+    return False
+
+
+def translate_sql(sql: str, variables: Iterable[str] | None = None) -> str:
+    """Translate a Source Qualifier SQL override to T-SQL (statement level).
+
+    An override is a complete statement written in the *source* database
+    dialect, so the expression-only rewrites are skipped and the statement is
+    translated line by line: a line that is a comment is copied verbatim, so
+    commented-out code is neither translated nor reported as untranslated.
+    """
+    s = substitute_variables(sql, variables)
+    if has_flattened_comments(s):
+        s = reflow_comments(s)
+
+    lines: list[str] = []
+    for line in s.splitlines():
+        if line.lstrip().startswith("--"):
+            lines.append(line.rstrip())
+            continue
+        lines.append(_warn_untranslated(_translate_scalars(line, sql_mode=True)).rstrip())
+    return "\n".join(lines).strip("\n")
 
 
 # --- conditional aggregates --------------------------------------------------
@@ -297,18 +566,34 @@ def _translate_iif(s: str) -> str:
 
 # --- scalar functions ---------------------------------------------------------
 
-def _translate_scalars(s: str) -> str:
-    s = _replace_in_forms(s)
-    s = _replace_isnull(s)
-    s = _replace_replacestr(s)
+def _translate_scalars(s: str, sql_mode: bool = False) -> str:
+    """Apply the scalar passes.
+
+    ``sql_mode`` is used for Source Qualifier SQL overrides, i.e. complete
+    statements written in the source database dialect rather than PowerCenter
+    expressions.  The PowerCenter-only rewrites are then skipped: ``IN(x, a,
+    b)`` -> ``x IN (a, b)`` would mangle a standard ``x IN (a, b)`` list, and
+    ``isnull(x)`` / ``REPLACESTR`` do not exist in a SQL statement.
+    """
+    if not sql_mode:
+        s = _replace_in_forms(s)
+        s = _replace_isnull(s)
+        s = _replace_replacestr(s)
     s = _replace_conversions(s)   # CHR / TO_CHAR / TO_DATE
+    s = _replace_get_date_part(s)  # GET_DATE_PART(x, 'YYYY') -> year text
     s = _replace_to_integer(s)    # TO_INTEGER -> TRY_CAST(... AS INT)
     s = _replace_zeroifnull(s)    # ZEROIFNULL -> COALESCE(..., 0)
     s = _replace_date_diff(s)     # DATE_DIFF -> DATEDIFF
     s = _replace_decode(s)        # DECODE -> CASE ... END
     s = _replace_substr(s)        # SUBSTR -> SUBSTRING
     s = _replace_concat(s)        # || -> + (PowerCenter string concatenation)
+    s = _replace_trunc(s)         # TRUNC -> CAST(... AS DATE) / ROUND(..., 1)
+    s = _replace_add_months(s)    # ADD_MONTHS -> DATEADD(MONTH, ...)
+    s = _replace_nvl(s)           # NVL -> COALESCE
+    s = _replace_date_literals(s)  # DATE 'x' -> CAST('x' AS DATE)
+    s = _replace_date_today(s)    # SYSDATE / CURRENT_DATE
     s = _upper_logical(s)
+    s = _replace_not_comparison(s)  # NOT x = y -> x <> y
     return s
 
 
@@ -422,6 +707,41 @@ _ORACLE_FMT_TO_TSTYLE = {
     "DD.MM.YYYY": "104",  # dd.mm.yyyy
 }
 
+# TO_CHAR formats that render the year as digits -> how many digits they keep.
+# Oracle (and therefore PowerCenter) keeps only the last N digits for the
+# short forms, so 'YY' is '17' and not '2017'.  GET_DATE_PART accepts the same
+# year formats.
+_YEAR_FORMAT_DIGITS = {"YYYY": 4, "YYY": 3, "YY": 2, "Y": 1}
+
+
+def _year_text(expr: str, digits: int) -> str:
+    """T-SQL text form of the year of ``expr``, keeping ``digits`` digits."""
+    year = f"CAST(YEAR({expr}) AS VARCHAR(4))"
+    return year if digits == 4 else f"RIGHT({year}, {digits})"
+
+
+def _unwrap_year_text(arg: str) -> str | None:
+    """``CAST(YEAR(x) AS VARCHAR(n))`` -> ``YEAR(x)``, otherwise ``None``.
+
+    Used to drop the redundant round trip through text when the value is
+    converted back to a number (``TO_INTEGER(TO_CHAR(x, 'YYYY'))``).
+    """
+    m = re.match(r"CAST\s*\(", arg, re.IGNORECASE)
+    if not m:
+        return None
+    j = m.end() - 1
+    if _find_matching(arg, j) != len(arg) - 1:
+        return None
+    inside = arg[j + 1:-1].strip()
+    tail = re.search(r"\s+AS\s+VARCHAR\s*\(\s*\d+\s*\)$", inside, re.IGNORECASE)
+    if not tail:
+        return None
+    expr = inside[:tail.start()].strip()
+    year = re.match(r"YEAR\s*\(", expr, re.IGNORECASE)
+    if not year or _find_matching(expr, year.end() - 1) != len(expr) - 1:
+        return None
+    return expr
+
 
 def _replace_conversions(s: str) -> str:
     """Translate the PowerCenter conversion functions.
@@ -461,10 +781,16 @@ def _replace_chr(s: str) -> str:
 def _replace_to_char(s: str) -> str:
     """``TO_CHAR(x [, fmt])`` -> ``CAST(x AS VARCHAR(255))``.
 
-    PowerCenter TO_CHAR converts a value to a string; the Oracle-style format
-    string (2nd argument) has no direct SQL Server equivalent, so it is dropped.
-    The length 255 is a documented default: the original port PRECISION is not
-    consulted here because the translator operates on expressions alone.
+    When the format string is one of the known date formats the value is
+    rendered with ``CONVERT(VARCHAR(n), x, style)`` instead: dropping the
+    format would turn a date into its default ``Mon dd yyyy hh:mmAM`` text and
+    break any comparison against a date.  ``n`` is the length of the format
+    literal, which is the length of the rendered date.
+
+    A format that renders only the year (``YYYY``, and the last-digit forms
+    ``YYY`` / ``YY`` / ``Y``) is rendered from ``YEAR(x)``: casting a date to
+    VARCHAR without the format would give its text representation, not the
+    year.  Any other format is dropped (documented limitation).
     """
     out: list[str] = []
     i = 0
@@ -476,7 +802,18 @@ def _replace_to_char(s: str) -> str:
             if end != -1:
                 parts = _split_top_level(s[j + 1:end])
                 arg = parts[0].strip() if parts else ""
-                out.append(f"CAST({arg} AS VARCHAR(255))")
+                style = ""
+                fmt = ""
+                if len(parts) >= 2:
+                    fmt = parts[1].strip().strip("'\"")
+                    style = _ORACLE_FMT_TO_TSTYLE.get(fmt.upper(), "")
+                digits = _YEAR_FORMAT_DIGITS.get(fmt.upper())
+                if digits:
+                    out.append(_year_text(arg, digits))
+                elif style:
+                    out.append(f"CONVERT(VARCHAR({max(8, len(fmt))}), {arg}, {style})")
+                else:
+                    out.append(f"CAST({arg} AS VARCHAR(255))")
                 i = end + 1
                 continue
         out.append(s[i])
@@ -518,6 +855,42 @@ def _replace_to_date(s: str) -> str:
     return "".join(out)
 
 
+def _replace_get_date_part(s: str) -> str:
+    """``GET_DATE_PART(x, 'YYYY')`` -> ``CAST(YEAR(x) AS VARCHAR(4))``.
+
+    PowerCenter returns the requested date part as text; only the year formats
+    are translated (same last-N-digits rule as ``TO_CHAR``).  Emitting the same
+    text form means a surrounding ``TO_INTEGER`` collapses to a plain
+    ``YEAR(x)`` (see ``_unwrap_year_text``).  Any other date part is left
+    untouched and reported as untranslated rather than guessed.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "'":
+            i = _skip_string_literal(s, i, out)
+            continue
+        if s[i] in "gG" and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")):
+            m = re.match(r"GET_DATE_PART\s*\(", s[i:], re.IGNORECASE)
+            if m:
+                j = i + m.end() - 1
+                end = _find_matching(s, j)
+                if end != -1:
+                    parts = _split_top_level(s[j + 1:end])
+                    digits = None
+                    if len(parts) >= 2:
+                        fmt = parts[1].strip().strip("'\"")
+                        digits = _YEAR_FORMAT_DIGITS.get(fmt.upper())
+                    if digits:
+                        out.append(_year_text(parts[0].strip(), digits))
+                        i = end + 1
+                        continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def _is_null_literal(x: str) -> bool:
     """True when ``x`` is the bare NULL literal (case-insensitive)."""
     return x.strip().upper() == "NULL"
@@ -531,6 +904,9 @@ def _replace_to_integer(s: str) -> str:
     zero, and ``TRY_CAST`` additionally returns NULL instead of raising on an
     unconvertible string (closer to PowerCenter's runtime conversion-error
     handling than a hard CAST -- documented choice).
+
+    ``TO_INTEGER(TO_CHAR(x, 'YYYY'))`` is a year extraction written the long
+    way: the round trip through text is dropped and the result is ``YEAR(x)``.
     """
     out: list[str] = []
     i = 0
@@ -546,7 +922,8 @@ def _replace_to_integer(s: str) -> str:
                 end = _find_matching(s, j)
                 if end != -1:
                     arg = _replace_to_integer(s[j + 1:end].strip())
-                    out.append(f"TRY_CAST({arg} AS INT)")
+                    year = _unwrap_year_text(arg)
+                    out.append(year if year else f"TRY_CAST({arg} AS INT)")
                     i = end + 1
                     continue
         out.append(s[i])
@@ -658,6 +1035,165 @@ def _skip_string_literal(s: str, i: int, out: list[str]) -> int:
         out.append(s[i])
         i += 1
     return i
+
+
+def _map_outside_literals(s: str, fn) -> str:
+    """Apply ``fn`` to the code segments of ``s``, leaving literals untouched."""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    start = 0
+    while i < n:
+        if s[i] != "'":
+            i += 1
+            continue
+        out.append(fn(s[start:i]))
+        end = _string_end(s, i)
+        out.append(s[i:end])
+        i = end
+        start = end
+    out.append(fn(s[start:n]))
+    return "".join(out)
+
+
+def _rewrite_calls(s: str, name: str, build) -> str:
+    """Rewrite every ``NAME(...)`` call for which ``build`` returns a string.
+
+    ``build`` receives the (recursively rewritten) positional arguments and
+    returns the T-SQL replacement, or ``None`` to leave the call untouched.
+    String literals are never matched, and ``NAME`` must be a whole identifier
+    (so ``TRUNCATE`` is not mistaken for ``TRUNC``).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    L = len(name)
+    while i < n:
+        if s[i] == "'":
+            i = _skip_string_literal(s, i, out)
+            continue
+        if (s[i:i + L].upper() == name
+                and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_"))):
+            j = i + L
+            while j < n and s[j] in " \t":
+                j += 1
+            if j < n and s[j] == "(":
+                end = _find_matching(s, j)
+                if end != -1:
+                    args = [_rewrite_calls(a, name, build)
+                            for a in _split_top_level(s[j + 1:end])]
+                    replacement = build(args)
+                    if replacement is not None:
+                        out.append(replacement)
+                        i = end + 1
+                        continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _replace_trunc(s: str) -> str:
+    """``TRUNC(x)`` -> ``CAST(x AS DATE)``;  ``TRUNC(x, n)`` -> ``ROUND(x, n, 1)``.
+
+    Teradata/Oracle TRUNC truncates a timestamp to midnight (one argument) or a
+    number to ``n`` decimals (two arguments).  ``ROUND`` with a non-zero third
+    argument truncates instead of rounding, which is the numeric form.
+    """
+    def build(args: list[str]) -> str | None:
+        if len(args) == 1:
+            return f"CAST({args[0].strip()} AS DATE)"
+        if len(args) == 2 and re.fullmatch(r"-?\d+", args[1].strip()):
+            return f"ROUND({args[0].strip()}, {args[1].strip()}, 1)"
+        return None
+
+    return _rewrite_calls(s, "TRUNC", build)
+
+
+def _replace_add_months(s: str) -> str:
+    """``ADD_MONTHS(x, n)`` -> ``DATEADD(MONTH, n, x)``."""
+    def build(args: list[str]) -> str | None:
+        if len(args) == 2:
+            return f"DATEADD(MONTH, {args[1].strip()}, {args[0].strip()})"
+        return None
+
+    return _rewrite_calls(s, "ADD_MONTHS", build)
+
+
+def _replace_nvl(s: str) -> str:
+    """``NVL(a, b)`` -> ``COALESCE(a, b)`` (same NULL fallback semantics)."""
+    def build(args: list[str]) -> str | None:
+        if len(args) == 2:
+            return f"COALESCE({args[0].strip()}, {args[1].strip()})"
+        return None
+
+    return _rewrite_calls(s, "NVL", build)
+
+
+# Typed date literal of the source dialect: ``DATE '2026-10-22'``.
+_DATE_LITERAL_RE = re.compile(r"\bDATE\s*'((?:[^']|'')*)'", re.IGNORECASE)
+# Same literal, but built from a mapping variable: ``DATE '$$DATA_ELAB'`` has
+# already become ``DATE @DATA_ELAB`` by the time this pass runs.
+_DATE_VAR_RE = re.compile(r"\bDATE\s+@([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+_SYSDATE_RE = re.compile(r"\bSYSDATE\b(?!\s*\()", re.IGNORECASE)
+_CURRENT_DATE_RE = re.compile(r"\bCURRENT_DATE\b(?!\s*\()", re.IGNORECASE)
+
+
+def _replace_date_literals(s: str) -> str:
+    """``DATE 'x'`` -> ``CAST('x' AS DATE)``;  ``DATE @X`` -> ``CAST(NULLIF(@X, '') AS DATE)``.
+
+    The source dialects (Teradata, Oracle) accept a typed date literal, T-SQL
+    does not.  When the literal is a mapping variable that was declared without
+    a value, NULLIF makes it NULL so the run returns no rows instead of
+    silently comparing against 1900-01-01.
+    """
+    def repl(m: re.Match[str]) -> str:
+        literal = m.group(1)
+        if "@" in literal or "$(" in literal:
+            return f"CAST(NULLIF('{literal}', '') AS DATE)"
+        return f"CAST('{literal}' AS DATE)"
+
+    s = _DATE_LITERAL_RE.sub(repl, s)
+    return _DATE_VAR_RE.sub(
+        lambda m: f"CAST(NULLIF(@{m.group(1)}, '') AS DATE)", s)
+
+
+def _replace_date_today(s: str) -> str:
+    """``SYSDATE`` -> ``GETDATE()``;  ``CURRENT_DATE`` -> ``CAST(GETDATE() AS DATE)``."""
+    s = _map_outside_literals(s, lambda code: _SYSDATE_RE.sub("GETDATE()", code))
+    return _map_outside_literals(
+        s, lambda code: _CURRENT_DATE_RE.sub("CAST(GETDATE() AS DATE)", code))
+
+
+# Teradata accepts ``NOT <expr> <op> <expr>`` (``NOT col = 'x'``) where T-SQL
+# requires the inverted predicate (``col <> 'x'``).
+_COMPARISON_OPERAND = r"(?:'(?:[^']|'')*'|[A-Za-z_][\w.]*(?:\s*\([^()]*\))?|\d+(?:\.\d+)?)"
+_NOT_COMPARISON_RE = re.compile(
+    r"\bNOT\s+(" + _COMPARISON_OPERAND + r")\s*(=|<>|!=|<=|>=|<|>)\s*(" + _COMPARISON_OPERAND + r")",
+    re.IGNORECASE,
+)
+_COMPARISON_INVERSE = {
+    "=": "<>", "<>": "=", "!=": "=",
+    "<": ">=", "<=": ">", ">": "<=", ">=": "<",
+}
+
+
+def _replace_not_comparison(s: str) -> str:
+    """``NOT x = y`` -> ``x <> y`` (each comparison operator is inverted)."""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "'":
+            i = _skip_string_literal(s, i, out)
+            continue
+        m = _NOT_COMPARISON_RE.match(s, i)
+        if m:
+            out.append(f"{m.group(1)} {_COMPARISON_INVERSE[m.group(2)]} {m.group(3)}")
+            i = m.end()
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
 
 
 def _replace_decode(s: str) -> str:
@@ -845,6 +1381,11 @@ _HANDLED_NAMES = frozenset({
     "CASE", "WHEN", "THEN", "ELSE", "END",
     # ISNULL pass emits `IS NULL` / `IS NOT NULL`
     "IS", "NULL",
+    # SQL operators / keywords that legitimately precede a parenthesis in a
+    # statement (``BETWEEN (...)``, ``FROM (SELECT ...)``): they are not calls
+    # and must not be reported as untranslated functions.
+    "BETWEEN", "EXISTS", "LIKE", "ALL", "ANY", "SOME", "DISTINCT", "VALUES",
+    "FROM", "WHERE", "ON", "SELECT", "UNION", "JOIN", "GROUP", "ORDER", "HAVING",
 
     # --- standard T-SQL functions (valid in SQL Server) -----------------------
     # String functions:
@@ -861,7 +1402,7 @@ _HANDLED_NAMES = frozenset({
     # Conversion / coalesce functions (ISNULL deliberately excluded, see above):
     "COALESCE", "NULLIF", "TRY_CONVERT", "TRY_CAST",
     # Ranking (window) functions:
-    "ROW_NUMBER", "RANK", "DENSE_RANK",
+    "ROW_NUMBER", "RANK", "DENSE_RANK", "OVER",
 
     # T-SQL data-type names: these legitimately appear as ``TYPE(...)`` inside
     # CAST/CONVERT (e.g. ``CONVERT(VARCHAR(10), ...)``) and are not functions,
@@ -891,6 +1432,9 @@ def _scan_untranslated(s: str) -> list[tuple[int, str]]:
     i = 0
     n = len(s)
     while i < n:
+        if s.startswith("/*", i):
+            i = _block_end(s, i)
+            continue
         if s[i] == "'":
             i += 1
             while i < n:

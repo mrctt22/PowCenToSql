@@ -17,6 +17,8 @@ Extensions for the group-based transformations (Router / Union / Joiner):
   ``INPUTFIELD`` -> ``OUTPUTFIELD``, i.e. which input field feeds each output).
 * ``Node.templatename`` distinguishes a Custom Transformation by its template
   (e.g. ``"Union Transformation"``).
+* ``Mapping.variables`` holds the ``<MAPPINGVARIABLE>`` objects (``$$DATA_ELAB``
+  and friends), which the emitter declares as T-SQL variables.
 """
 
 from __future__ import annotations
@@ -109,6 +111,34 @@ class Node:
 
 
 @dataclass
+class MappingVariable:
+    """A PowerCenter mapping variable / parameter (``<MAPPINGVARIABLE>``).
+
+    ``name`` keeps the PowerCenter spelling including the ``$$`` prefix
+    (``$$DATA_ELAB``); ``reference_name`` is what the generated script uses.
+    """
+    name: str
+    datatype: str = ""
+    default: str = ""
+    aggfunction: str = ""
+    isparam: str = ""
+    precision: str = ""
+    scale: str = ""
+    description: str = ""
+
+    @property
+    def reference_name(self) -> str:
+        """Name used by the generated script (``$$DATA_ELAB`` -> ``DATA_ELAB``)."""
+        return self.name.lstrip("$")
+
+    @property
+    def type_text(self) -> str:
+        if self.precision:
+            return f"{self.datatype}({self.precision})"
+        return self.datatype
+
+
+@dataclass
 class Edge:
     """A connector between two instances."""
     from_obj: str
@@ -127,9 +157,15 @@ class Mapping:
     nodes: dict[str, Node] = field(default_factory=dict)
     edges: list[Edge] = field(default_factory=list)
     order: list[str] = field(default_factory=list)   # topo-sorted instance names
+    variables: list[MappingVariable] = field(default_factory=list)
 
     def node(self, name: str) -> Node | None:
         return self.nodes.get(name)
+
+    @property
+    def variable_names(self) -> list[str]:
+        """Mapping variable names (``$$NAME``) in declaration order."""
+        return [v.name for v in self.variables]
 
     @property
     def source_nodes(self) -> list[Node]:

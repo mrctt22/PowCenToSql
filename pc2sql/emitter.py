@@ -15,21 +15,41 @@ Group-based transformations are expanded into one SQL object per output group:
   group as the ``NOT(...)`` of the others), each named ``<router>__<group>``.
 * Joiner           -> CTE with a JOIN (master = ``.../MASTER`` ports, detail =
   the other input group, direction from ``Join Type``).
-* Union            -> CTE with ``UNION ALL`` of every input group, mapping
-  input fields to output fields via ``FIELDDEPENDENCY``.
+* Union            -> CTE with ``UNION ALL`` of every input group: the
+  connector gives the upstream column of each input field and
+  ``FIELDDEPENDENCY`` gives the output field it feeds.  An input field no
+  connector feeds contributes NULL (PowerCenter's unconnected port).
 * Sorter           -> passthrough CTE (``SELECT DISTINCT`` when
   ``Distinct=YES``); sort keys are recorded as comments because T-SQL has no
   ordered relation and a CTE-level ORDER BY would not survive downstream.
 * Update Strategy  -> an INSERT / UPDATE / DELETE / MERGE statement (a
   statement block, not a CTE) whose form follows ``Update Strategy Expression``.
+
+Per-object details worth knowing:
+
+* Source Qualifier -> CTE over the associated source table; ``Source Filter``
+  becomes its WHERE clause (a ``Sql Query`` override takes precedence, as in
+  PowerCenter).
+* Expression / Aggregator -> ``LOCAL VARIABLE`` ports become a CROSS APPLY
+  chain, so aggregates can reference them (``SUM(SALDO_CBI_IN)`` where the
+  variable is a constant).
+
+Two kinds of object are emitted outside the CTE chain:
+
+* ``<MAPPINGVARIABLE>`` -> batch-scoped ``DECLARE`` statements (``$$DATA_ELAB``
+  becomes ``@DATA_ELAB``), emitted before the ``WITH``.
+* Source Qualifier ``Sql Query`` overrides -> the statement is translated from
+  the source dialect to T-SQL (``expressions.translate_sql``), including the
+  ``--`` comments that the export flattened onto a single line; without that
+  step a comment would swallow the rest of the statement.
 """
 
 from __future__ import annotations
 
 import re
 
-from .expressions import translate
-from .ir import Edge, Mapping, Node, Port
+from .expressions import has_flattened_comments, translate, translate_sql
+from .ir import Edge, Mapping, MappingVariable, Node, Port
 
 
 def _ident(name: str) -> str:
@@ -54,6 +74,11 @@ def _upstreams(m: Mapping, node: Node) -> list[str]:
         if e.to_obj == node.name and e.from_obj not in seen:
             seen.append(e.from_obj)
     return seen
+
+
+def _translate(expr: str, m: Mapping) -> str:
+    """Translate a PowerCenter expression, resolving its mapping variables."""
+    return translate(expr, m.variable_names)
 
 
 def _input_map(m: Mapping, node: Node) -> dict[str, str]:
@@ -160,15 +185,93 @@ def _emit_target_def(node: Node) -> str:
     ])
 
 
+# PowerCenter datatype -> T-SQL type used for the variable declarations.
+_PC_TYPE_TO_SQL = {
+    "string": "VARCHAR",
+    "nstring": "NVARCHAR",
+    "date/time": "DATETIME2",
+    "date": "DATE",
+    "decimal": "DECIMAL",
+    "double": "FLOAT",
+    "real": "REAL",
+    "integer": "INT",
+    "bigint": "BIGINT",
+    "smallint": "SMALLINT",
+    "tinyint": "TINYINT",
+}
+_STRING_TYPES = ("string", "nstring")
+_TEMPORAL_TYPES = ("date/time", "date")
+
+
+def _variable_declaration(v: MappingVariable) -> str:
+    """``DECLARE @NAME <type> = <value>;`` for one mapping variable.
+
+    T-SQL variables (rather than SQLCMD ``:setvar``) keep the script runnable
+    in SSMS without SQLCMD mode.  The declaration carries no value when the
+    PowerCenter variable has no default, so a forgotten setting cannot silently
+    filter on an arbitrary date.
+    """
+    kind = (v.datatype or "").strip().lower()
+    sql_type = _PC_TYPE_TO_SQL.get(kind, "VARCHAR(255)")
+    if kind in _STRING_TYPES:
+        limit = 4000 if kind == "nstring" else 8000
+        precision = int(v.precision) if v.precision.isdigit() else 0
+        sql_type = f"{sql_type}(MAX)" if not 0 < precision <= limit else f"{sql_type}({precision})"
+    elif kind == "decimal":
+        if v.precision.isdigit():
+            sql_type = f"DECIMAL({v.precision}{', ' + v.scale if v.scale.isdigit() else ''})"
+        else:
+            sql_type = "DECIMAL(18, 2)"
+
+    if not v.default:
+        value = "NULL"
+    elif kind in _STRING_TYPES or kind in _TEMPORAL_TYPES:
+        value = "'" + v.default.replace("'", "''") + "'"
+    else:
+        value = v.default
+
+    return f"DECLARE @{v.reference_name} {sql_type} = {value};"
+
+
+def _emit_mapping_variables(m: Mapping) -> str:
+    """MAPPINGVARIABLE objects -> batch-scoped DECLARE statements."""
+    if not m.variables:
+        return ""
+    lines = [
+        "-- ==========================================================================",
+        "-- Mapping variables (PowerCenter MAPPINGVARIABLE)",
+        "-- ==========================================================================",
+    ]
+    for v in m.variables:
+        details = [v.type_text or "string"]
+        if v.aggfunction:
+            details.append(f"aggregate={v.aggfunction}")
+        if v.isparam:
+            details.append(f"parameter={v.isparam}")
+        if v.description:
+            details.append(v.description)
+        lines.append(f"--   {v.name}  ({', '.join(details)})")
+    lines.append("--   Set each value before running the script: a variable left NULL makes")
+    lines.append("--   the date comparisons evaluate to NULL (no rows) instead of comparing")
+    lines.append("--   against an arbitrary date.")
+    for v in m.variables:
+        lines.append(_variable_declaration(v))
+    return "\n".join(lines)
+
+
 def _emit_sq(node: Node, m: Mapping) -> str:
     """Source Qualifier -> a CTE that SELECTs the source columns from the table.
 
     The physical table is the *associated source definition* (the
-    ASSOCIATED_SOURCE_INSTANCE on the SQ instance), not the SQ's own name.
+    ASSOCIATED_SOURCE_INSTANCE on the SQ instance), not the SQ's own name, and
+    its OWNERNAME is the schema: a mapping can read several sources, so the
+    owner is resolved per Source Qualifier.  The ``Source Filter`` attribute is
+    the row filter PowerCenter applies on the source read, so it becomes the
+    WHERE clause (a ``Sql Query`` override replaces the whole read instead).
     """
-    src = m.source_node
+    assoc = m.nodes.get(node.associated_source) if node.associated_source else None
     table_name = node.associated_source or node.definition or node.name
-    owner = src.ownername if src else ""
+    owner = assoc.ownername if assoc is not None else ""
     table = _ident(table_name)
     if owner:
         table = f"{_ident(owner)}.{table}"
@@ -180,15 +283,15 @@ def _emit_sq(node: Node, m: Mapping) -> str:
 
     lines = [_banner(node)]
     if query_attr:
-        # Custom SQL override: kept verbatim (it is not run through the
-        # expression translator, so any source-dialect syntax stays as-is) but
-        # wrapped in a CTE so downstream references resolve to a defined name.
-        lines.append("--   custom SQL override (kept verbatim, wrapped in a CTE)")
-        if "\n" not in query_attr and "\r" not in query_attr and "--" in query_attr:
-            lines.append("-- WARNING: the override contains inline '--' comments but the export")
-            lines.append("--          flattened its line breaks; restore the newlines before executing.")
+        # Custom SQL override: dialect functions are translated to T-SQL and
+        # the statement is wrapped in a CTE so downstream references resolve
+        # to a defined name.
+        lines.append("--   custom SQL override (source dialect translated, wrapped in a CTE)")
+        if has_flattened_comments(query_attr):
+            lines.append("--   the export had flattened this override onto one line: its '--'")
+            lines.append("--   comments are back on their own lines (verify their extent)")
         lines.append(f"{_ident(node.name)} AS (")
-        lines.append(query_attr)
+        lines.append(translate_sql(query_attr, m.variable_names))
         lines.append(")")
         return "\n".join(lines)
 
@@ -197,12 +300,63 @@ def _emit_sq(node: Node, m: Mapping) -> str:
     lines.append("        " + ",\n        ".join(_ident(c) for c in cols))
     lines.append(f"    FROM {table}")
     if filter_attr:
-        lines.append(f"    -- Source Filter: {filter_attr}")
+        # The Source Filter is the WHERE of the source read: translate it (it
+        # is written in the source dialect and may use mapping variables) and
+        # apply it, rather than keeping it as a comment.
+        cond = translate_sql(filter_attr, m.variable_names)
+        body = "\n".join(
+            line for line in cond.splitlines() if not line.lstrip().startswith("--")
+        ).strip()
+        if body:
+            if "\n" in cond:
+                lines.append("    WHERE")
+                lines.extend(
+                    ("        " + line) if line.strip() else line
+                    for line in cond.splitlines()
+                )
+            else:
+                lines.append(f"    WHERE {cond}")
+        else:
+            lines.append("    -- Source Filter is fully commented out in the export:")
+            lines.append("    -- " + filter_attr)
     lines.append(")")
     return "\n".join(lines)
 
 
 # --- relational (CTE) transformations ----------------------------------------
+
+def _local_variable_applies(node: Node, m: Mapping) -> tuple[list[str], dict[str, str]]:
+    """``LOCAL VARIABLE`` ports -> sequential CROSS APPLY lines + alias map.
+
+    A PowerCenter local variable is a row-level expression, evaluated before
+    the node's own expressions (and usable in any of them).  The CROSS APPLY
+    chain keeps that order, so a variable can reference the previous ones.
+    """
+    applies: list[str] = []
+    alias: dict[str, str] = {}
+    for idx, lv in enumerate(node.local_variables):
+        expr = _substitute(lv.expression, alias)
+        expr = _translate(expr, m)
+        name = f"lv{idx}"
+        applies.append(
+            f"    CROSS APPLY (SELECT {expr} AS {_ident(lv.name)}) {name}"
+        )
+        alias[lv.name] = f"{name}.{_ident(lv.name)}"
+    return applies, alias
+
+
+def _rename_columns(node: Node, in_map: dict[str, str]) -> list[str]:
+    """Upstream columns renamed to this node's input port names."""
+    cols: list[str] = []
+    for inp in node.input_ports:
+        if inp.name in in_map:
+            src_col = in_map[inp.name]
+            if src_col != inp.name:
+                cols.append(f"{_ident(src_col)} AS {_ident(inp.name)}")
+            else:
+                cols.append(_ident(inp.name))
+    return cols
+
 
 def _emit_expression(node: Node, m: Mapping) -> str:
     upstream = _upstream_refs(m, node)
@@ -210,28 +364,8 @@ def _emit_expression(node: Node, m: Mapping) -> str:
         f"FROM {upstream[0]} /* + {len(upstream)-1} more inputs */"
 
     in_map = _input_map(m, node)
-
-    # local variables -> sequential CROSS APPLY, referenced by alias
-    lv_alias: dict[str, str] = {}
-    applies: list[str] = []
-    for idx, lv in enumerate(node.local_variables):
-        expr = _substitute(lv.expression, lv_alias)
-        expr = translate(expr)
-        alias = f"lv{idx}"
-        applies.append(
-            f"    CROSS APPLY (SELECT {expr} AS {_ident(lv.name)}) {alias}"
-        )
-        lv_alias[lv.name] = f"{alias}.{_ident(lv.name)}"
-
-    # inner derived table: rename upstream columns to this node's input port names
-    rename_cols = []
-    for inp in node.input_ports:
-        if inp.name in in_map:
-            src_col = in_map[inp.name]
-            if src_col != inp.name:
-                rename_cols.append(f"{_ident(src_col)} AS {_ident(inp.name)}")
-            else:
-                rename_cols.append(_ident(inp.name))
+    applies, lv_alias = _local_variable_applies(node, m)
+    rename_cols = _rename_columns(node, in_map)
 
     lines = [_banner(node)]
     lines.append(f"{_ident(node.name)} AS (")
@@ -245,7 +379,7 @@ def _emit_expression(node: Node, m: Mapping) -> str:
             select_lines.append((_ident(p.name), ""))
         else:
             expr = _substitute(p.expression, lv_alias)
-            expr = translate(expr)
+            expr = _translate(expr, m)
             select_lines.append((f"{expr} AS {_ident(p.name)}", p.name))
 
     # Always wrap the upstream in a rename subquery so this node's input-port
@@ -267,22 +401,23 @@ def _emit_expression(node: Node, m: Mapping) -> str:
 
 
 def _emit_aggregator(node: Node, m: Mapping) -> str:
+    """Aggregator -> CTE with GROUP BY (``GROUPBY`` ports) and aggregates.
+
+    ``LOCAL VARIABLE`` ports are resolved like in an Expression (CROSS APPLY),
+    because an aggregate can reference them (``SUM(SALDO_CBI_IN)`` where the
+    variable is 0): without them the aggregate would name a column that the
+    input does not have.
+    """
     upstream = _upstream_refs(m, node)
     from_clause = f"FROM {upstream[0]}" if len(upstream) == 1 else \
         f"FROM {upstream[0]} /* + {len(upstream)-1} more inputs */"
     in_map = _input_map(m, node)
+    applies, lv_alias = _local_variable_applies(node, m)
 
     group_ports = [p for p in node.output_ports if (p.expressiontype or "").upper() == "GROUPBY"]
     agg_ports = [p for p in node.output_ports if (p.expressiontype or "").upper() != "GROUPBY"]
 
-    rename_cols = []
-    for inp in node.input_ports:
-        if inp.name in in_map:
-            src_col = in_map[inp.name]
-            if src_col != inp.name:
-                rename_cols.append(f"{_ident(src_col)} AS {_ident(inp.name)}")
-            else:
-                rename_cols.append(_ident(inp.name))
+    rename_cols = _rename_columns(node, in_map)
 
     lines = [_banner(node)]
     lines.append(f"{_ident(node.name)} AS (")
@@ -291,7 +426,7 @@ def _emit_aggregator(node: Node, m: Mapping) -> str:
     for p in group_ports:
         select_lines.append((_ident(p.name), ""))
     for p in agg_ports:
-        expr = translate(p.expression)
+        expr = _translate(_substitute(p.expression, lv_alias), m)
         select_lines.append((f"{expr} AS {_ident(p.name)}", p.name))
 
     lines.append("    SELECT")
@@ -300,6 +435,8 @@ def _emit_aggregator(node: Node, m: Mapping) -> str:
     lines.append("        SELECT " + ", ".join(rename_cols))
     lines.append(f"        {from_clause}")
     lines.append("    ) src")
+    for a in applies:
+        lines.append(a)
     if group_ports:
         lines.append("    GROUP BY " + ", ".join(_ident(p.name) for p in group_ports))
     lines.append(")")
@@ -346,7 +483,7 @@ def _emit_filter(node: Node, m: Mapping) -> str:
     upstream = _upstream_refs(m, node)
     from_cte = upstream[0] if upstream else "(none)"
 
-    cond = translate(node.attributes.get("Filter Condition", ""))
+    cond = _translate(node.attributes.get("Filter Condition", ""), m)
     cond = _substitute(cond, in_map)
 
     select_lines = []
@@ -381,7 +518,7 @@ def _emit_router(node: Node, m: Mapping) -> list[str]:
     non_default_conds: list[str] = []
     for g in output_groups:
         if g.type == "OUTPUT":
-            non_default_conds.append(translate(_substitute(g.expression, in_map)))
+            non_default_conds.append(_translate(_substitute(g.expression, in_map), m))
 
     blocks: list[str] = []
     for g in output_groups:
@@ -393,7 +530,7 @@ def _emit_router(node: Node, m: Mapping) -> list[str]:
         ]
 
         if g.type == "OUTPUT":
-            where = translate(_substitute(g.expression, in_map))
+            where = _translate(_substitute(g.expression, in_map), m)
         else:
             parts = [f"NOT ({c})" for c in non_default_conds]
             where = " AND ".join(parts) if parts else "1 = 0"
@@ -410,10 +547,14 @@ def _emit_router(node: Node, m: Mapping) -> list[str]:
     return blocks
 
 
+# PowerCenter join type -> T-SQL, with the MASTER instance emitted on the left.
+# PowerCenter keeps the rows of the *other* side for its outer joins:
+#   Detail Outer Join -> all master rows + matching detail rows -> LEFT JOIN,
+#   Master Outer Join -> all detail rows + matching master rows -> RIGHT JOIN.
 _JOIN_TYPE_MAP = {
     "Normal Join": "INNER JOIN",
-    "Master Outer Join": "LEFT OUTER JOIN",
-    "Detail Outer Join": "RIGHT OUTER JOIN",
+    "Master Outer Join": "RIGHT OUTER JOIN",
+    "Detail Outer Join": "LEFT OUTER JOIN",
     "Full Outer Join": "FULL OUTER JOIN",
 }
 
@@ -447,7 +588,7 @@ def _emit_joiner(node: Node, m: Mapping) -> str:
 
     join_kw = _JOIN_TYPE_MAP.get(node.attributes.get("Join Type", ""), "INNER JOIN")
 
-    cond = translate(node.attributes.get("Join Condition", ""))
+    cond = _translate(node.attributes.get("Join Condition", ""), m)
     master_subst = {p.name: f"m.{_ident(in_map.get(p.name, p.name))}" for p in master_ports}
     detail_subst = {p.name: f"d.{_ident(in_map.get(p.name, p.name))}" for p in detail_ports}
     cond = _substitute(cond, {**master_subst, **detail_subst})
@@ -461,7 +602,9 @@ def _emit_joiner(node: Node, m: Mapping) -> str:
         select_lines.append(f"{side}.{_ident(col)} AS {_ident(p.name)}")
 
     lines = [_banner(node)]
-    lines.append(f"--   join type : {node.attributes.get('Join Type', '')}")
+    join_type = node.attributes.get("Join Type", "")
+    lines.append(f"--   join type : {join_type}" + (f"  ->  {join_kw}" if join_type else ""))
+    lines.append(f"--   master    : {master_up or '(n/a)'}   detail: {detail_up or '(n/a)'}")
     lines.append(f"{_ident(node.name)} AS (")
     lines.append("    SELECT")
     lines.append("        " + ",\n        ".join(select_lines))
@@ -475,19 +618,24 @@ def _emit_joiner(node: Node, m: Mapping) -> str:
 def _emit_union(node: Node, m: Mapping) -> str:
     """Union (Custom Transformation, template "Union Transformation") -> CTE.
 
-    One ``UNION ALL`` branch per ``<GROUP TYPE="INPUT">``; each branch selects
-    the group's input fields renamed to the output field names via
-    ``FIELDDEPENDENCY``.
+    One ``UNION ALL`` branch per ``<GROUP TYPE="INPUT">``.  A connector carries
+    the upstream column name to the Union's input field name (they rarely
+    coincide: ``IMPORTO_ENTRATEL_AG`` -> ``IMPORTO_ENTRATEL11``), and
+    ``FIELDDEPENDENCY`` maps each input field to the output field, so a branch
+    selects ``<upstream column> AS <output field>``.
     """
     out_group_name = next(
         (g.name for g in node.groups if g.type == "OUTPUT"), "OUTPUT"
     )
     input_groups = [g for g in node.groups if g.type == "INPUT"]
     dep = dict(node.field_dependencies)          # inputfield -> outputfield
+    # (upstream instance, input field) -> upstream column
+    conn = {(e.from_obj, e.to_field): e.from_field
+            for e in m.edges if e.to_obj == node.name}
 
     out_fields = [p for p in node.ports if p.group == out_group_name]
 
-    branches: list[tuple[str, list[str]]] = []
+    branches: list[tuple[str, list[tuple[str, str]]]] = []
     for g in input_groups:
         # upstream instance feeding this input group
         up_name = None
@@ -499,21 +647,40 @@ def _emit_union(node: Node, m: Mapping) -> str:
                 up_name = e.from_obj
                 break
 
-        select_lines = []
+        select_lines: list[tuple[str, str]] = []
         for out_p in out_fields:
-            for p in node.ports:
-                if p.group == g.name and dep.get(p.name) == out_p.name:
-                    select_lines.append(f"{_ident(p.name)} AS {_ident(out_p.name)}")
-                    break
+            in_p = next((p for p in node.ports
+                         if p.group == g.name and dep.get(p.name) == out_p.name), None)
+            if in_p is None:
+                select_lines.append((
+                    f"NULL AS {_ident(out_p.name)}",
+                    f"WARNING: group {g.name} has no input field for {out_p.name}",
+                ))
+                continue
+            src_col = conn.get((up_name, in_p.name))
+            if src_col is None:
+                up_node = m.nodes.get(up_name) if up_name else None
+                if up_node is not None and up_node.port(in_p.name) is not None:
+                    src_col = in_p.name
+                else:
+                    # An unconnected union input port contributes NULL rows.
+                    select_lines.append((
+                        f"NULL AS {_ident(out_p.name)}",
+                        f"WARNING: input field {in_p.name} is not connected "
+                        f"(group {g.name})",
+                    ))
+                    continue
+            select_lines.append((f"{_ident(src_col)} AS {_ident(out_p.name)}", ""))
         branches.append((up_name, select_lines))
 
     lines = [_banner(node)]
+    lines.append("--   groups    : " + ", ".join(g.name for g in input_groups))
     lines.append(f"{_ident(node.name)} AS (")
     for idx, (up_name, select_lines) in enumerate(branches):
         if idx > 0:
             lines.append("    UNION ALL")
         lines.append("    SELECT")
-        lines.append("        " + ",\n        ".join(select_lines))
+        lines.append(_render_select_list(select_lines))
         lines.append(f"    FROM {_ident(up_name or '(input)')}")
     lines.append(")")
     return "\n".join(lines)
@@ -625,6 +792,12 @@ def emit(m: Mapping) -> str:
     lines.append("-- Generated by pc2sql: one SQL object (CTE) per PowerCenter object,")
     lines.append("-- kept in data-flow order and referenced by PowerCenter object name.")
     lines.append("")
+
+    # mapping variables -> DECLARE statements (referenced by the overrides)
+    variables_block = _emit_mapping_variables(m)
+    if variables_block:
+        lines.append(variables_block)
+        lines.append("")
 
     # source / target definition banners first (informational references)
     for src in m.source_nodes:
